@@ -190,11 +190,59 @@ with st.sidebar:
     uploaded_file = st.file_uploader("① パフォーマンスレポートをアップロード", type=['csv'])
 
     if uploaded_file:
+        # --- ここから変更 ---
+        # ファイルから日付範囲を自動検出し、デフォルト値として設定する
+        default_start_date = datetime.now().date() - timedelta(days=90)
+        default_end_date = datetime.now().date()
+        date_detection_info = "学習期間を指定してください。"
+
+        try:
+            # ファイルを一時的に読み込み、日付範囲を特定
+            uploaded_file.seek(0)
+            temp_df_for_dates = None
+            possible_date_cols = ['日', '日付', 'Date', 'Day']
+            date_col_name = None
+            header_row_index = -1
+            found_encoding = None
+
+            for encoding in ['utf-8-sig', 'cp932', 'utf-8', 'sjis']:
+                try:
+                    uploaded_file.seek(0)
+                    header_peek = pd.read_csv(uploaded_file, encoding=encoding, header=None, dtype=str, nrows=20)
+                    
+                    for i, row in header_peek.iterrows():
+                        if 'キャンペーン名' in row.astype(str).values:
+                            header_row_index = i
+                            for col in possible_date_cols:
+                                if col in row.values:
+                                    date_col_name = col
+                                    break
+                            break
+                    if date_col_name:
+                        found_encoding = encoding
+                        break
+                except Exception:
+                    continue
+            
+            if date_col_name and found_encoding:
+                uploaded_file.seek(0)
+                date_series = pd.read_csv(uploaded_file, encoding=found_encoding, header=header_row_index, usecols=[date_col_name], dtype=str).iloc[:, 0]
+                dates = pd.to_datetime(date_series, errors='coerce').dropna()
+                if not dates.empty:
+                    default_start_date = dates.min().date()
+                    default_end_date = dates.max().date()
+                    date_detection_info = "ファイルから期間を自動設定しました。変更も可能です。"
+        except Exception:
+            # エラーが発生した場合は、デフォルト値を使用する
+            pass
+        finally:
+            uploaded_file.seek(0)
+
         st.subheader("② 学習データ期間")
-        today = datetime.now()
-        three_months_ago = today - timedelta(days=90)
-        training_start_date = st.date_input('開始日', value=three_months_ago)
-        training_end_date = st.date_input('終了日', value=today)
+        st.info(date_detection_info)
+        training_start_date = st.date_input('開始日', value=default_start_date)
+        training_end_date = st.date_input('終了日', value=default_end_date)
+        # --- ここまで変更 ---
         
         process_button = st.button('データを処理し、モデルを学習する', type="primary", use_container_width=True)
     else:
