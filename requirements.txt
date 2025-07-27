@@ -2,8 +2,8 @@ streamlit
 pandas
 numpy
 xgboost
-scikit-learn
 pulp
 jpholiday
 plotly
+pytrends
 xlsxwriter
