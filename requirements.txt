@@ -7,3 +7,4 @@ jpholiday
 plotly
 pytrends
 xlsxwriter
+scikit-learn
