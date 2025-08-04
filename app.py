@@ -23,9 +23,13 @@ def to_excel(df):
     processed_data = output.getvalue()
     return processed_data
 
-def get_features(trend_keywords_dict):
-    """トレンドキーワード辞書から特徴量リストを生成する"""
-    return ['cost', 'log_cost', 'weekday', 'month', 'week', 'is_holiday'] + list(trend_keywords_dict.keys())
+def get_features(trend_keywords_dict, use_trends):
+    """トレンドキーワード辞書と利用フラグから特徴量リストを生成する"""
+    base_features = ['cost', 'log_cost', 'weekday', 'month', 'week', 'is_holiday']
+    if use_trends:
+        return base_features + list(trend_keywords_dict.keys())
+    else:
+        return base_features
 
 # --- Googleトレンド関連の関数 ---
 @st.cache_data(ttl=3600) # 1時間キャッシュ
@@ -92,7 +96,7 @@ def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
 
 # --- 1. データ処理関数 ---
 @st.cache_data
-def preprocess_data(uploaded_file, column_mapping, training_start_date, training_end_date, trend_keywords_dict):
+def preprocess_data(uploaded_file, column_mapping, training_start_date, training_end_date, trend_keywords_dict, use_trends):
     """アップロードされたファイルを前処理し、特徴量を作成する"""
     if uploaded_file is None: return None, "ファイルがアップロードされていません。", None
 
@@ -145,12 +149,16 @@ def preprocess_data(uploaded_file, column_mapping, training_start_date, training
     df_selected['is_holiday'] = df_selected['日'].apply(lambda x: 1 if jpholiday.is_holiday(x) else 0)
     df_selected['log_cost'] = np.log1p(df_selected['cost'])
 
-    try:
-        trends_df = fetch_and_prepare_trends_data(training_start_date, training_end_date, trend_keywords_dict)
-        df_selected = pd.merge(df_selected, trends_df, on='日', how='left')
-        df_selected[list(trend_keywords_dict.keys())] = df_selected[list(trend_keywords_dict.keys())].fillna(0)
-    except Exception as e:
-        return None, f"Googleトレンドデータの取得またはマージに失敗しました: {e}", None
+    if use_trends:
+        try:
+            trends_df = fetch_and_prepare_trends_data(training_start_date, training_end_date, trend_keywords_dict)
+            df_selected = pd.merge(df_selected, trends_df, on='日', how='left')
+            df_selected[list(trend_keywords_dict.keys())] = df_selected[list(trend_keywords_dict.keys())].fillna(0)
+        except Exception as e:
+            return None, f"Googleトレンドデータの取得またはマージに失敗しました: {e}", None
+    else:
+        for category in trend_keywords_dict.keys():
+            df_selected[category] = 0
 
     training_df = df_selected[(df_selected['日'] >= pd.to_datetime(training_start_date)) & (df_selected['日'] <= pd.to_datetime(training_end_date))]
     
@@ -161,11 +169,11 @@ def preprocess_data(uploaded_file, column_mapping, training_start_date, training
 
 # --- 2. モデル学習関数 ---
 @st.cache_data
-def train_models(_df, trend_keywords_dict):
+def train_models(_df, trend_keywords_dict, use_trends):
     """キャンペーンごとにXGBoostモデルを学習し、特徴量の重要度も返す"""
     models = {}
     feature_importances = pd.DataFrame()
-    features = get_features(trend_keywords_dict)
+    features = get_features(trend_keywords_dict, use_trends)
     
     campaign_names = _df['campaign_name'].unique()
     latest_date = _df['日'].max()
@@ -195,10 +203,10 @@ def train_models(_df, trend_keywords_dict):
     return models, feature_importances
 
 # --- 3. 最適化関数 ---
-def optimize_budget_allocation(total_budget, models, features_today, campaign_max_budgets, trend_keywords_dict):
+def optimize_budget_allocation(total_budget, models, features_today, campaign_max_budgets, trend_keywords_dict, use_trends):
     """数理最適化を用いて、CVを最大化する予算配分を計算する"""
     campaign_names = list(models.keys())
-    features = get_features(trend_keywords_dict)
+    features = get_features(trend_keywords_dict, use_trends)
     problem = pulp.LpProblem("Budget_Allocation_Problem", pulp.LpMaximize)
     
     step = max(1000, int(total_budget / 100))
@@ -281,9 +289,8 @@ with st.sidebar:
         training_start_date = st.date_input('開始日', value=default_start_date)
         training_end_date = st.date_input('終了日', value=default_end_date)
     
-    with st.expander("③ Googleトレンドキーワード設定 (推奨)", expanded=False):
-        st.info("予測精度向上のため、関連するキーワードをカテゴリごとに入力してください。カンマ区切りで複数指定可能です。")
-        
+    with st.expander("③ Googleトレンドキーワード設定", expanded=False):
+        st.info("予測精度向上のため、関連するキーワードをカテゴリごとに入力してください。")
         temp_keywords = {}
         for category, keywords in st.session_state.trend_keywords.items():
             input_str = st.text_area(f"カテゴリ: {category}", ", ".join(keywords), height=50)
@@ -292,6 +299,11 @@ with st.sidebar:
         if st.button("キーワードを更新"):
             st.session_state.trend_keywords = collections.OrderedDict(temp_keywords)
             st.success("キーワードを更新しました。")
+
+    # --- 修正箇所: トレンド利用の選択機能 ---
+    st.subheader("④ 予測オプション")
+    use_trends = st.checkbox("Googleトレンドを予測に利用する", value=True, help="APIが不安定な場合や、トレンドデータが不要な場合はチェックを外してください。")
+    # --- 修正ここまで ---
 
     if uploaded_file:
         process_button = st.button('データを処理し、モデルを学習する', type="primary", use_container_width=True)
@@ -314,21 +326,25 @@ else:
             column_mapping = {k: v for k, v in user_mapping.items() if k is not None}
 
     if process_button:
-        with st.spinner('データ前処理とGoogleトレンドデータ取得、モデル学習を実行中...'):
-            data, error_message = preprocess_data(uploaded_file, column_mapping, training_start_date, training_end_date, st.session_state.trend_keywords)
+        spinner_text = 'データ前処理とモデル学習を実行中...'
+        if use_trends:
+            spinner_text = 'データ前処理とGoogleトレンドデータ取得、モデル学習を実行中...'
+        
+        with st.spinner(spinner_text):
+            data, error_message = preprocess_data(uploaded_file, column_mapping, training_start_date, training_end_date, st.session_state.trend_keywords, use_trends)
             if error_message:
                 st.error(f"エラー: {error_message}")
                 st.session_state.data_processed = False
             else:
                 st.session_state.original_data = data
-                models, importances = train_models(data, st.session_state.trend_keywords)
+                models, importances = train_models(data, st.session_state.trend_keywords, use_trends)
                 st.session_state.trained_models = models
                 st.session_state.feature_importances = importances
                 st.session_state.data_processed = True
                 st.success("データ処理とモデル学習が完了しました。")
     
     if st.session_state.data_processed:
-        st.header("④ 最適化シミュレーション")
+        st.header("⑤ 最適化シミュレーション")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -351,31 +367,32 @@ else:
             run_optimization_button = st.button('🚀 この設定で最適化を実行する', type="primary", use_container_width=True)
 
             if run_optimization_button:
-                with st.spinner('最適化計算を実行中... (1年前のトレンドデータを参照します)'):
-                    # --- 修正箇所 ---
-                    # 最適化期間に対応する「1年前」のトレンドデータを取得
-                    fetch_start_ly = optim_start_date - timedelta(days=365)
-                    fetch_end_ly = optim_end_date - timedelta(days=365)
-                    
-                    trends_for_optim_ly = fetch_and_prepare_trends_data(fetch_start_ly, fetch_end_ly, st.session_state.trend_keywords)
-                    trends_for_optim_ly.set_index('日', inplace=True)
-                    # --- 修正ここまで ---
+                spinner_text = '最適化計算を実行中...'
+                if use_trends:
+                    spinner_text = '最適化計算を実行中... (1年前のトレンドデータを参照します)'
+
+                with st.spinner(spinner_text):
+                    trends_for_optim_ly = pd.DataFrame()
+                    if use_trends:
+                        fetch_start_ly = optim_start_date - timedelta(days=365)
+                        fetch_end_ly = optim_end_date - timedelta(days=365)
+                        trends_for_optim_ly = fetch_and_prepare_trends_data(fetch_start_ly, fetch_end_ly, st.session_state.trend_keywords)
+                        trends_for_optim_ly.set_index('日', inplace=True)
 
                     date_range = pd.date_range(optim_start_date, optim_end_date)
                     daily_results = []
                     progress_bar = st.progress(0, text="最適化計算を実行中...")
 
                     for i, target_date in enumerate(date_range):
-                        # --- 修正箇所 ---
-                        # 1年前の該当日を計算
-                        date_ly = pd.to_datetime(target_date - timedelta(days=365))
-                        
                         trend_features = {}
-                        if date_ly in trends_for_optim_ly.index:
-                             trend_features = trends_for_optim_ly.loc[date_ly].to_dict()
-                        else: # 1年前にデータがない場合は0で埋める
-                             trend_features = {cat: 0 for cat in st.session_state.trend_keywords.keys()}
-                        # --- 修正ここまで ---
+                        if use_trends:
+                            date_ly = pd.to_datetime(target_date - timedelta(days=365))
+                            if date_ly in trends_for_optim_ly.index:
+                                 trend_features = trends_for_optim_ly.loc[date_ly].to_dict()
+                            else:
+                                 trend_features = {cat: 0 for cat in st.session_state.trend_keywords.keys()}
+                        else:
+                            trend_features = {cat: 0 for cat in st.session_state.trend_keywords.keys()}
 
                         features_for_today = {
                             'weekday': target_date.weekday(), 'month': target_date.month,
@@ -386,7 +403,7 @@ else:
 
                         optimal_budgets, total_cv, cv_breakdown, status = optimize_budget_allocation(
                             total_daily_budget, st.session_state.trained_models, features_for_today, 
-                            campaign_max_budgets_input, st.session_state.trend_keywords
+                            campaign_max_budgets_input, st.session_state.trend_keywords, use_trends
                         )
                         daily_results.append({'date': target_date, 'allocation': optimal_budgets, 'cv': total_cv, 'cv_breakdown': cv_breakdown, 'status': status})
                         progress_bar.progress((i + 1) / len(date_range), text=f"最適化計算: {target_date.strftime('%m/%d')}")
@@ -458,11 +475,13 @@ else:
 
             with tab3:
                 st.subheader("🩺 特徴量の重要度")
-                st.info("これは、どの要素（曜日、月、祝日、トレンドなど）がCV数予測に影響を与えたかを示す指標です。最適化結果の「健全性」を確認するための診断機能としてご活用ください。")
-                
-                importances = st.session_state.get('feature_importances')
-                if importances is not None and not importances.empty:
-                    avg_importances = importances.groupby('feature')['importance'].mean().sort_values(ascending=False)
-                    fig_imp = px.bar(avg_importances, x=avg_importances.values, y=avg_importances.index, orientation='h', title='特徴量の重要度（全キャンペーン平均）')
-                    fig_imp.update_layout(xaxis_title='重要度', yaxis_title='特徴量')
-                    st.plotly_chart(fig_imp, use_container_width=True)
+                if use_trends:
+                    st.info("これは、どの要素（曜日、月、祝日、トレンドなど）がCV数予測に影響を与えたかを示す指標です。最適化結果の「健全性」を確認するための診断機能としてご活用ください。")
+                    importances = st.session_state.get('feature_importances')
+                    if importances is not None and not importances.empty:
+                        avg_importances = importances.groupby('feature')['importance'].mean().sort_values(ascending=False)
+                        fig_imp = px.bar(avg_importances, x=avg_importances.values, y=avg_importances.index, orientation='h', title='特徴量の重要度（全キャンペーン平均）')
+                        fig_imp.update_layout(xaxis_title='重要度', yaxis_title='特徴量')
+                        st.plotly_chart(fig_imp, use_container_width=True)
+                else:
+                    st.info("Googleトレンドを利用していないため、特徴量の重要度は表示されません。")
