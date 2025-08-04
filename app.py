@@ -10,6 +10,7 @@ from io import BytesIO
 from pytrends.request import TrendReq
 import time
 import collections
+import random
 
 # --- 0. アプリケーション設定とヘルパー関数 ---
 st.set_page_config(layout="wide", page_title="広告予算配分 最適化シミュレーター")
@@ -26,12 +27,12 @@ def get_features(trend_keywords_dict):
     """トレンドキーワード辞書から特徴量リストを生成する"""
     return ['cost', 'log_cost', 'weekday', 'month', 'week', 'is_holiday'] + list(trend_keywords_dict.keys())
 
-# --- Googleトレンド関連の関数 ---
+# --- Googleトレンド関連の関数 (修正) ---
 @st.cache_data(ttl=3600) # 1時間キャッシュ
 def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
     """
     指定された期間とキーワードでGoogleトレンドデータを取得し、日別データフレームを返す。
-    長期間のリクエストはエラーになるため、180日単位のチャンクでデータを取得する。
+    長期間のリクエストは180日単位で分割し、API制限(429エラー)には指数バックオフで対応する。
     """
     pytrends = TrendReq(hl='ja-JP', tz=360)
     
@@ -41,7 +42,6 @@ def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
             all_trends_data[category] = pd.Series(dtype=float)
             continue
 
-        # チャンクでデータを取得
         total_df = pd.DataFrame()
         current_start = pd.to_datetime(start_date)
         end_date_dt = pd.to_datetime(end_date)
@@ -53,35 +53,39 @@ def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
             
             timeframe = f'{current_start.strftime("%Y-%m-%d")} {current_end.strftime("%Y-%m-%d")}'
             
-            try:
-                pytrends.build_payload(kw_list, cat=0, timeframe=timeframe, geo='JP')
-                time.sleep(1) # APIへの負荷を軽減
-                interest_over_time_df = pytrends.interest_over_time()
+            # --- 指数バックオフによるリトライ処理を追加 ---
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    pytrends.build_payload(kw_list, cat=0, timeframe=timeframe, geo='JP')
+                    time.sleep(1) # APIへの負荷を軽減
+                    interest_over_time_df = pytrends.interest_over_time()
+                    
+                    if not interest_over_time_df.empty:
+                        total_df = pd.concat([total_df, interest_over_time_df])
+                    break # 成功したらループを抜ける
                 
-                if not interest_over_time_df.empty:
-                    total_df = pd.concat([total_df, interest_over_time_df])
-                
-            except Exception as e:
-                st.warning(f"トレンドデータの一部取得中にエラーが発生しました ({category}, {timeframe}): {e}")
-                pass
+                except Exception as e:
+                    if "429" in str(e) and attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) + random.random()
+                        st.warning(f"API制限を検出しました。{wait_time:.1f}秒待機して再試行します... ({attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        st.warning(f"トレンドデータの一部取得中にエラーが発生しました ({category}, {timeframe}): {e}")
+                        break # 429以外のエラーまたは最大リトライ回数に達したら諦める
+            # --- リトライ処理ここまで ---
 
             current_start = current_end + timedelta(days=1)
 
         if not total_df.empty and 'isPartial' in total_df.columns:
-            # チャンクの境界で発生する可能性のある重複を削除
             total_df = total_df[~total_df.index.duplicated(keep='first')]
             all_trends_data[category] = total_df.drop(columns='isPartial').mean(axis=1)
         else:
             all_trends_data[category] = pd.Series(dtype=float)
 
-    # 全カテゴリを一つのデータフレームに結合
     trends_df = pd.DataFrame(all_trends_data)
-    
-    # 全ての日付が含まれるようにインデックスを再設定
     all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
     trends_df = trends_df.reindex(all_dates)
-
-    # 欠損値を前方・後方で埋め、それでも残る場合は0で埋める
     trends_df = trends_df.ffill().bfill().fillna(0)
     
     return trends_df.reset_index().rename(columns={'index': '日'})
@@ -94,7 +98,6 @@ def preprocess_data(uploaded_file, column_mapping, training_start_date, training
     if uploaded_file is None: return None, "ファイルがアップロードされていません。", None
 
     df = None
-    # さまざまなエンコーディングを試す
     for encoding in ['utf-8-sig', 'cp932', 'utf-8', 'sjis']:
         try:
             uploaded_file.seek(0)
@@ -104,7 +107,6 @@ def preprocess_data(uploaded_file, column_mapping, training_start_date, training
             continue
     if df is None: return None, "ファイルの読み込みに失敗しました。対応する文字コードが見つかりません。", None
 
-    # ヘッダー行を自動検出
     header_row_index = -1
     for i, row in df.iterrows():
         if row.astype(str).str.contains('キャンペーン名').any():
@@ -119,7 +121,6 @@ def preprocess_data(uploaded_file, column_mapping, training_start_date, training
     df = df[header_row_index + 1:]
     df.columns = new_header
     
-    # 合計行を削除
     total_row_index = df[df.iloc[:, 0].astype(str).str.contains('合計', na=False)].index
     if not total_row_index.empty:
         df = df.loc[:total_row_index[0]-1]
@@ -139,14 +140,12 @@ def preprocess_data(uploaded_file, column_mapping, training_start_date, training
     except Exception as e:
         return None, f"データ型変換中にエラーが発生しました: {e}。CSVのフォーマットを確認してください。", None
 
-    # 特徴量エンジニアリング
     df_selected['weekday'] = df_selected['日'].dt.weekday
     df_selected['month'] = df_selected['日'].dt.month
     df_selected['week'] = df_selected['日'].dt.isocalendar().week.astype(int)
     df_selected['is_holiday'] = df_selected['日'].apply(lambda x: 1 if jpholiday.is_holiday(x) else 0)
     df_selected['log_cost'] = np.log1p(df_selected['cost'])
 
-    # Googleトレンドデータを取得してマージ
     try:
         trends_df = fetch_and_prepare_trends_data(training_start_date, training_end_date, trend_keywords_dict)
         df_selected = pd.merge(df_selected, trends_df, on='日', how='left')
@@ -154,7 +153,6 @@ def preprocess_data(uploaded_file, column_mapping, training_start_date, training
     except Exception as e:
         return None, f"Googleトレンドデータの取得またはマージに失敗しました: {e}", None
 
-    # 学習期間でフィルタリング
     training_df = df_selected[(df_selected['日'] >= pd.to_datetime(training_start_date)) & (df_selected['日'] <= pd.to_datetime(training_end_date))]
     
     if training_df.empty:
@@ -177,7 +175,6 @@ def train_models(_df, trend_keywords_dict):
         campaign_df = _df[_df['campaign_name'] == campaign].copy()
         if len(campaign_df) < 10: continue
 
-        # 直近のデータに重み付け
         recency_in_days = (latest_date - campaign_df['日']).dt.days
         sample_weights = np.where(recency_in_days <= 30, 3.0, 1.0)
         
@@ -191,7 +188,6 @@ def train_models(_df, trend_keywords_dict):
         model.fit(X, y, sample_weight=sample_weights)
         models[campaign] = model
 
-        # 特徴量の重要度を格納
         temp_importance = pd.DataFrame(
             data={'feature': features, 'importance': model.feature_importances_, 'campaign': campaign}
         )
@@ -206,14 +202,12 @@ def optimize_budget_allocation(total_budget, models, features_today, campaign_ma
     features = get_features(trend_keywords_dict)
     problem = pulp.LpProblem("Budget_Allocation_Problem", pulp.LpMaximize)
     
-    # 予算の刻み幅を設定
     step = max(1000, int(total_budget / 100))
     budget_steps = list(range(0, total_budget + 1, step))
     if not budget_steps: budget_steps = [0, total_budget]
     
     choices = pulp.LpVariable.dicts("Choice", (campaign_names, budget_steps), cat='Binary')
     
-    # 各キャンペーン・各予算ステップでのCV数を予測
     predicted_cvs = {}
     for campaign in campaign_names:
         predicted_cvs[campaign] = {}
@@ -227,16 +221,11 @@ def optimize_budget_allocation(total_budget, models, features_today, campaign_ma
         for i, budget in enumerate(budget_steps):
             predicted_cvs[campaign][budget] = max(0, predictions[i])
 
-    # 目的関数：総CV数を最大化
     problem += pulp.lpSum(predicted_cvs[c][b] * choices[c][b] for c in campaign_names for b in budget_steps)
     
-    # 制約条件
-    # 1. 総予算を超えない
     problem += pulp.lpSum(b * choices[c][b] for c in campaign_names for b in budget_steps) <= total_budget
-    # 2. 各キャンペーンは1つの予算しか選べない
     for c in campaign_names:
         problem += pulp.lpSum(choices[c][b] for b in budget_steps) == 1
-    # 3. 各キャンペーンの上限予算を超えない
     for c in campaign_names:
         problem += pulp.lpSum(b * choices[c][b] for b in budget_steps) <= campaign_max_budgets[c]
 
@@ -257,13 +246,11 @@ def optimize_budget_allocation(total_budget, models, features_today, campaign_ma
 # --- 4. Streamlit UI ---
 st.title('🚀 広告予算配分 最適化シミュレーター (v2)')
 
-# --- session_state の初期化 ---
 if 'data_processed' not in st.session_state:
     st.session_state.data_processed = False
 if 'column_mapping_required' not in st.session_state:
     st.session_state.column_mapping_required = False
 if 'trend_keywords' not in st.session_state:
-    # デフォルトのキーワードを設定
     st.session_state.trend_keywords = collections.OrderedDict({
         'general_trend': ['塾講師 バイト', '塾 バイト'],
         'brand_trend': ['塾講師ステーション'],
@@ -271,13 +258,11 @@ if 'trend_keywords' not in st.session_state:
         'station_trend': ['東京 塾 求人', '大阪 塾 求人', '名古屋 塾 求人', '京都 塾 求人']
     })
 
-# --- サイドバー ---
 with st.sidebar:
     st.header('⚙️ 基本設定')
     uploaded_file = st.file_uploader("① パフォーマンスレポートをアップロード", type=['csv'])
 
     if uploaded_file:
-        # 学習期間の自動設定
         default_start_date = datetime.now().date() - timedelta(days=90)
         default_end_date = datetime.now().date()
         try:
@@ -289,7 +274,7 @@ with st.sidebar:
                 if not dates.empty:
                     default_start_date, default_end_date = dates.min().date(), dates.max().date()
         except Exception:
-            pass # エラーでもデフォルト値で続行
+            pass
         finally:
             uploaded_file.seek(0)
 
@@ -297,7 +282,6 @@ with st.sidebar:
         training_start_date = st.date_input('開始日', value=default_start_date)
         training_end_date = st.date_input('終了日', value=default_end_date)
     
-    # トレンドキーワード設定
     with st.expander("③ Googleトレンドキーワード設定 (推奨)", expanded=False):
         st.info("予測精度向上のため、関連するキーワードをカテゴリごとに入力してください。カンマ区切りで複数指定可能です。")
         
@@ -315,11 +299,9 @@ with st.sidebar:
     else:
         process_button = False
 
-# --- メイン画面 ---
 if uploaded_file is None:
     st.info("サイドバーからCSVファイルをアップロードして開始してください。")
 else:
-    # 列名マッピング処理
     column_mapping = {'日': '日', 'キャンペーン名': 'campaign_name', 'コスト': 'cost', 'コンバージョン数': 'conversions'}
     if st.session_state.column_mapping_required:
         with st.expander("⚠️ 列名のマッピングが必要です", expanded=True):
@@ -371,14 +353,14 @@ else:
 
             if run_optimization_button:
                 with st.spinner('最適化計算を実行中...'):
-                    # --- 修正箇所 ---
-                    # 未来の予測には、直近のトレンドデータを使用する
-                    # APIエラーを避けるため、リクエストは本日までとする
                     today = datetime.now().date()
-                    fetch_start = today - timedelta(days=90) # 直近90日分のトレンドを取得
-                    trends_for_optim = fetch_and_prepare_trends_data(fetch_start, today, st.session_state.trend_keywords)
-                    trends_for_optim.set_index('日', inplace=True)
-                    # --- 修正ここまで ---
+                    fetch_start = optim_start_date if optim_start_date < today else today - timedelta(days=90)
+                    fetch_end = min(optim_end_date, today)
+                    
+                    trends_for_optim = pd.DataFrame()
+                    if fetch_start <= fetch_end:
+                        trends_for_optim = fetch_and_prepare_trends_data(fetch_start, fetch_end, st.session_state.trend_keywords)
+                        trends_for_optim.set_index('日', inplace=True)
 
                     date_range = pd.date_range(optim_start_date, optim_end_date)
                     daily_results = []
@@ -386,14 +368,20 @@ else:
 
                     for i, target_date in enumerate(date_range):
                         target_date_ts = pd.Timestamp(target_date)
-                        # 未来の日付の場合は、取得したトレンドデータの最新日を使用する
-                        trend_date_to_use = min(target_date_ts, trends_for_optim.index.max())
                         
+                        trend_date_to_use = min(target_date_ts, trends_for_optim.index.max()) if not trends_for_optim.empty else None
+                        
+                        trend_features = {}
+                        if trend_date_to_use and trend_date_to_use in trends_for_optim.index:
+                             trend_features = trends_for_optim.loc[trend_date_to_use].to_dict()
+                        else: # トレンドデータがない場合は0で埋める
+                             trend_features = {cat: 0 for cat in st.session_state.trend_keywords.keys()}
+
                         features_for_today = {
                             'weekday': target_date.weekday(), 'month': target_date.month,
                             'week': target_date.isocalendar().week,
                             'is_holiday': 1 if jpholiday.is_holiday(target_date) else 0,
-                            **trends_for_optim.loc[trend_date_to_use].to_dict()
+                            **trend_features
                         }
 
                         optimal_budgets, total_cv, cv_breakdown, status = optimize_budget_allocation(
@@ -407,12 +395,10 @@ else:
                     st.session_state.optim_period = (optim_start_date, optim_end_date)
                     st.success("最適化が完了しました。")
 
-        # --- 結果表示 ---
         if 'daily_results' in st.session_state and st.session_state.daily_results:
             st.header(f'📊 最適化結果（{st.session_state.optim_period[0].strftime("%Y/%m/%d")} 〜 {st.session_state.optim_period[1].strftime("%Y/%m/%d")}）')
             
             daily_results = st.session_state.daily_results
-            # 1日でも最適化が失敗したかチェック
             if any(res['status'] != "Optimal" for res in daily_results):
                 failed_dates = [res['date'].strftime('%Y-%m-%d') for res in daily_results if res['status'] != "Optimal"]
                 st.error(f"以下の日付で最適化に失敗しました: {', '.join(failed_dates)}\n\n"
@@ -421,9 +407,8 @@ else:
                          f"- 「キャンペーン別の上限予算」の制約が厳しすぎる可能性があります。\n\n"
                          f"予算設定を見直して、再度最適化を実行してください。")
             
-            # パフォーマンスサマリー
             with st.container(border=True):
-                st.subheader("� パフォーマンスサマリー")
+                st.subheader("📈 パフォーマンスサマリー")
                 total_allocated_sum = sum(sum(res['allocation'].values()) for res in daily_results if res['allocation'])
                 total_predicted_cv_sum = sum(res['cv'] for res in daily_results if res['cv'] is not None)
                 total_predicted_cpa = total_allocated_sum / total_predicted_cv_sum if total_predicted_cv_sum > 0 else 0
@@ -433,7 +418,6 @@ else:
                 col2.metric(label="予測 総CV数", value=f"{total_predicted_cv_sum:.2f} 件")
                 col3.metric(label="予測 CPA", value=f"{total_predicted_cpa:,.0f} 円")
 
-            # 結果詳細
             avg_allocations = pd.DataFrame([res['allocation'] for res in daily_results if res['allocation']]).mean()
             avg_cvs = pd.DataFrame([res['cv_breakdown'] for res in daily_results if res['cv_breakdown']]).mean()
             result_df = pd.DataFrame({'1日あたりの平均推奨予算': avg_allocations, '1日あたりの平均予測CV数': avg_cvs}).fillna(0)
@@ -478,9 +462,7 @@ else:
                 
                 importances = st.session_state.get('feature_importances')
                 if importances is not None and not importances.empty:
-                    # キャンペーンごとに平均を取る
                     avg_importances = importances.groupby('feature')['importance'].mean().sort_values(ascending=False)
                     fig_imp = px.bar(avg_importances, x=avg_importances.values, y=avg_importances.index, orientation='h', title='特徴量の重要度（全キャンペーン平均）')
                     fig_imp.update_layout(xaxis_title='重要度', yaxis_title='特徴量')
                     st.plotly_chart(fig_imp, use_container_width=True)
-                    
