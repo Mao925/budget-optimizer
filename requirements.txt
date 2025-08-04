@@ -6,5 +6,6 @@ pulp
 jpholiday
 plotly
 openpyxl
+xlsxwriter
 pytrends
 scikit-learn
