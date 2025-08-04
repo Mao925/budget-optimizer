@@ -26,36 +26,64 @@ def get_features(trend_keywords_dict):
     """トレンドキーワード辞書から特徴量リストを生成する"""
     return ['cost', 'log_cost', 'weekday', 'month', 'week', 'is_holiday'] + list(trend_keywords_dict.keys())
 
-# --- Googleトレンド関連の関数 ---
+# --- Googleトレンド関連の関数 (修正) ---
 @st.cache_data(ttl=3600) # 1時間キャッシュ
 def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
-    """指定された期間とキーワードでGoogleトレンドデータを取得し、日別データフレームを返す"""
+    """
+    指定された期間とキーワードでGoogleトレンドデータを取得し、日別データフレームを返す。
+    長期間のリクエストはエラーになるため、180日単位のチャンクでデータを取得する。
+    """
     pytrends = TrendReq(hl='ja-JP', tz=360)
-    all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
-    trends_df = pd.DataFrame(index=all_dates)
-
+    
+    all_trends_data = {}
     for category, kw_list in trend_keywords_dict.items():
         if not kw_list:
-            trends_df[category] = 0
+            all_trends_data[category] = pd.Series(dtype=float)
             continue
-        try:
-            # 期間が長すぎる場合、pytrendsはデータを週次で返すことがあるため、短い期間でループする
-            # ここでは簡略化のため一括取得を試みる
-            pytrends.build_payload(kw_list, cat=0, timeframe=f'{start_date.strftime("%Y-%m-%d")} {end_date.strftime("%Y-%m-%d")}', geo='JP')
-            time.sleep(1) # APIへの負荷を軽減
-            interest_over_time_df = pytrends.interest_over_time()
 
-            if not interest_over_time_df.empty and 'isPartial' in interest_over_time_df.columns:
-                # 取得したトレンドデータの平均をカテゴリの代表値とする
-                trends_df[category] = interest_over_time_df.drop(columns='isPartial').mean(axis=1)
-            else:
-                trends_df[category] = 0
-        except Exception as e:
-            st.warning(f"トレンドデータの取得中にエラーが発生しました ({category}): {e}")
-            trends_df[category] = 0
+        # チャンクでデータを取得
+        total_df = pd.DataFrame()
+        current_start = pd.to_datetime(start_date)
+        end_date_dt = pd.to_datetime(end_date)
+        
+        while current_start <= end_date_dt:
+            current_end = current_start + timedelta(days=180)
+            if current_end > end_date_dt:
+                current_end = end_date_dt
+            
+            timeframe = f'{current_start.strftime("%Y-%m-%d")} {current_end.strftime("%Y-%m-%d")}'
+            
+            try:
+                pytrends.build_payload(kw_list, cat=0, timeframe=timeframe, geo='JP')
+                time.sleep(1) # APIへの負荷を軽減
+                interest_over_time_df = pytrends.interest_over_time()
+                
+                if not interest_over_time_df.empty:
+                    total_df = pd.concat([total_df, interest_over_time_df])
+                
+            except Exception as e:
+                st.warning(f"トレンドデータの一部取得中にエラーが発生しました ({category}, {timeframe}): {e}")
+                pass
+
+            current_start = current_end + timedelta(days=1)
+
+        if not total_df.empty and 'isPartial' in total_df.columns:
+            # チャンクの境界で発生する可能性のある重複を削除
+            total_df = total_df[~total_df.index.duplicated(keep='first')]
+            all_trends_data[category] = total_df.drop(columns='isPartial').mean(axis=1)
+        else:
+            all_trends_data[category] = pd.Series(dtype=float)
+
+    # 全カテゴリを一つのデータフレームに結合
+    trends_df = pd.DataFrame(all_trends_data)
+    
+    # 全ての日付が含まれるようにインデックスを再設定
+    all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+    trends_df = trends_df.reindex(all_dates)
 
     # 欠損値を前方・後方で埋め、それでも残る場合は0で埋める
-    trends_df = trends_df.resample('D').ffill().bfill().fillna(0)
+    trends_df = trends_df.ffill().bfill().fillna(0)
+    
     return trends_df.reset_index().rename(columns={'index': '日'})
 
 
