@@ -5,6 +5,6 @@ xgboost
 pulp
 jpholiday
 plotly
+openpyxl
 pytrends
-xlsxwriter
 scikit-learn
