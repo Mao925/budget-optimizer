@@ -483,4 +483,4 @@ else:
                     fig_imp = px.bar(avg_importances, x=avg_importances.values, y=avg_importances.index, orientation='h', title='特徴量の重要度（全キャンペーン平均）')
                     fig_imp.update_layout(xaxis_title='重要度', yaxis_title='特徴量')
                     st.plotly_chart(fig_imp, use_container_width=True)
-�
+                    
