@@ -27,7 +27,7 @@ def get_features(trend_keywords_dict):
     """トレンドキーワード辞書から特徴量リストを生成する"""
     return ['cost', 'log_cost', 'weekday', 'month', 'week', 'is_holiday'] + list(trend_keywords_dict.keys())
 
-# --- Googleトレンド関連の関数 (修正) ---
+# --- Googleトレンド関連の関数 ---
 @st.cache_data(ttl=3600) # 1時間キャッシュ
 def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
     """
@@ -53,7 +53,7 @@ def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
             
             timeframe = f'{current_start.strftime("%Y-%m-%d")} {current_end.strftime("%Y-%m-%d")}'
             
-            # --- 指数バックオフによるリトライ処理を追加 ---
+            # 指数バックオフによるリトライ処理
             max_retries = 5
             for attempt in range(max_retries):
                 try:
@@ -63,7 +63,7 @@ def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
                     
                     if not interest_over_time_df.empty:
                         total_df = pd.concat([total_df, interest_over_time_df])
-                    break # 成功したらループを抜ける
+                    break 
                 
                 except Exception as e:
                     if "429" in str(e) and attempt < max_retries - 1:
@@ -72,8 +72,7 @@ def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
                         time.sleep(wait_time)
                     else:
                         st.warning(f"トレンドデータの一部取得中にエラーが発生しました ({category}, {timeframe}): {e}")
-                        break # 429以外のエラーまたは最大リトライ回数に達したら諦める
-            # --- リトライ処理ここまで ---
+                        break
 
             current_start = current_end + timedelta(days=1)
 
@@ -263,8 +262,8 @@ with st.sidebar:
     uploaded_file = st.file_uploader("① パフォーマンスレポートをアップロード", type=['csv'])
 
     if uploaded_file:
-        default_start_date = datetime.now().date() - timedelta(days=90)
-        default_end_date = datetime.now().date()
+        default_start_date = datetime.now().date() - timedelta(days=365)
+        default_end_date = datetime.now().date() - timedelta(days=1)
         try:
             uploaded_file.seek(0)
             temp_df = pd.read_csv(uploaded_file, encoding='cp932', on_bad_lines='skip')
@@ -333,9 +332,9 @@ else:
         
         col1, col2 = st.columns(2)
         with col1:
-            optim_start_date = st.date_input('最適化期間（開始日）', value=datetime.now().date() + timedelta(days=1))
+            optim_start_date = st.date_input('最適化期間（開始日）', value=datetime.now().date())
         with col2:
-            optim_end_date = st.date_input('最適化期間（終了日）', value=datetime.now().date() + timedelta(days=7))
+            optim_end_date = st.date_input('最適化期間（終了日）', value=datetime.now().date() + timedelta(days=6))
 
         if optim_start_date > optim_end_date:
             st.error('エラー: 終了日は開始日以降に設定してください。')
@@ -352,30 +351,31 @@ else:
             run_optimization_button = st.button('🚀 この設定で最適化を実行する', type="primary", use_container_width=True)
 
             if run_optimization_button:
-                with st.spinner('最適化計算を実行中...'):
-                    today = datetime.now().date()
-                    fetch_start = optim_start_date if optim_start_date < today else today - timedelta(days=90)
-                    fetch_end = min(optim_end_date, today)
+                with st.spinner('最適化計算を実行中... (1年前のトレンドデータを参照します)'):
+                    # --- 修正箇所 ---
+                    # 最適化期間に対応する「1年前」のトレンドデータを取得
+                    fetch_start_ly = optim_start_date - timedelta(days=365)
+                    fetch_end_ly = optim_end_date - timedelta(days=365)
                     
-                    trends_for_optim = pd.DataFrame()
-                    if fetch_start <= fetch_end:
-                        trends_for_optim = fetch_and_prepare_trends_data(fetch_start, fetch_end, st.session_state.trend_keywords)
-                        trends_for_optim.set_index('日', inplace=True)
+                    trends_for_optim_ly = fetch_and_prepare_trends_data(fetch_start_ly, fetch_end_ly, st.session_state.trend_keywords)
+                    trends_for_optim_ly.set_index('日', inplace=True)
+                    # --- 修正ここまで ---
 
                     date_range = pd.date_range(optim_start_date, optim_end_date)
                     daily_results = []
                     progress_bar = st.progress(0, text="最適化計算を実行中...")
 
                     for i, target_date in enumerate(date_range):
-                        target_date_ts = pd.Timestamp(target_date)
-                        
-                        trend_date_to_use = min(target_date_ts, trends_for_optim.index.max()) if not trends_for_optim.empty else None
+                        # --- 修正箇所 ---
+                        # 1年前の該当日を計算
+                        date_ly = pd.to_datetime(target_date - timedelta(days=365))
                         
                         trend_features = {}
-                        if trend_date_to_use and trend_date_to_use in trends_for_optim.index:
-                             trend_features = trends_for_optim.loc[trend_date_to_use].to_dict()
-                        else: # トレンドデータがない場合は0で埋める
+                        if date_ly in trends_for_optim_ly.index:
+                             trend_features = trends_for_optim_ly.loc[date_ly].to_dict()
+                        else: # 1年前にデータがない場合は0で埋める
                              trend_features = {cat: 0 for cat in st.session_state.trend_keywords.keys()}
+                        # --- 修正ここまで ---
 
                         features_for_today = {
                             'weekday': target_date.weekday(), 'month': target_date.month,
