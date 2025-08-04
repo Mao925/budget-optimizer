@@ -26,7 +26,7 @@ def get_features(trend_keywords_dict):
     """トレンドキーワード辞書から特徴量リストを生成する"""
     return ['cost', 'log_cost', 'weekday', 'month', 'week', 'is_holiday'] + list(trend_keywords_dict.keys())
 
-# --- Googleトレンド関連の関数 (修正) ---
+# --- Googleトレンド関連の関数 ---
 @st.cache_data(ttl=3600) # 1時間キャッシュ
 def fetch_and_prepare_trends_data(start_date, end_date, trend_keywords_dict):
     """
@@ -371,9 +371,14 @@ else:
 
             if run_optimization_button:
                 with st.spinner('最適化計算を実行中...'):
-                    # 最適化期間のトレンドデータを取得
-                    trends_for_optim = fetch_and_prepare_trends_data(optim_start_date, optim_end_date, st.session_state.trend_keywords)
+                    # --- 修正箇所 ---
+                    # 未来の予測には、直近のトレンドデータを使用する
+                    # APIエラーを避けるため、リクエストは本日までとする
+                    today = datetime.now().date()
+                    fetch_start = today - timedelta(days=90) # 直近90日分のトレンドを取得
+                    trends_for_optim = fetch_and_prepare_trends_data(fetch_start, today, st.session_state.trend_keywords)
                     trends_for_optim.set_index('日', inplace=True)
+                    # --- 修正ここまで ---
 
                     date_range = pd.date_range(optim_start_date, optim_end_date)
                     daily_results = []
@@ -381,6 +386,7 @@ else:
 
                     for i, target_date in enumerate(date_range):
                         target_date_ts = pd.Timestamp(target_date)
+                        # 未来の日付の場合は、取得したトレンドデータの最新日を使用する
                         trend_date_to_use = min(target_date_ts, trends_for_optim.index.max())
                         
                         features_for_today = {
@@ -417,7 +423,7 @@ else:
             
             # パフォーマンスサマリー
             with st.container(border=True):
-                st.subheader("📈 パフォーマンスサマリー")
+                st.subheader("� パフォーマンスサマリー")
                 total_allocated_sum = sum(sum(res['allocation'].values()) for res in daily_results if res['allocation'])
                 total_predicted_cv_sum = sum(res['cv'] for res in daily_results if res['cv'] is not None)
                 total_predicted_cpa = total_allocated_sum / total_predicted_cv_sum if total_predicted_cv_sum > 0 else 0
@@ -477,3 +483,4 @@ else:
                     fig_imp = px.bar(avg_importances, x=avg_importances.values, y=avg_importances.index, orientation='h', title='特徴量の重要度（全キャンペーン平均）')
                     fig_imp.update_layout(xaxis_title='重要度', yaxis_title='特徴量')
                     st.plotly_chart(fig_imp, use_container_width=True)
+�
